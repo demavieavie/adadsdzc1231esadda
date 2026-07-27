@@ -1,14 +1,16 @@
+
 if _G.__WISHUB_GAG2_AUTOTAME then return end
 _G.__WISHUB_GAG2_AUTOTAME = true
 
 local CONFIG = {
+    ------------------------------------------------------------------ AUTO TAME
     ------------------------------------------------------------------ AUTO TAME
     autoTame        = true,    -- true = continuously tame matching wild pets
     autoHop         = true,   -- true = clear this server, then hop to a new one for more
     hopDelay        = 13,       -- seconds to wait before each server hop (5-30)
     tameRarities    = {},      -- only these rarities, e.g. {"Legendary","Mythic","Super"}.  {} = any
     tameNames       = {},      -- only these species, e.g. {"Raccoon","Dragonfly"}.          {} = any
-    tameMoveSpeed   = 16,      -- how fast you walk to each pet (16 = normal ... 50 = max)
+    tameMoveSpeed   = 8,      -- how fast you walk to each pet (16 = normal ... 50 = max)
     tameReturnAfter = true,    -- (no effect while protectWildTame is false)
     maxPetPrice     = 0,       -- skip pets costing more than this (0 = no limit). Number, e.g. 15e6
     protectWildTame = false,   -- hold the shovel + knock back nearby players while taming
@@ -22,12 +24,12 @@ local CONFIG = {
 
     ------------------------------------------------------------------ AUTO COLLECT
     autoSellFruit     = true,    -- auto-sell ALL your fruit (Steven's "Sell All")
-    sellFruitDelay    = 30,      -- seconds between fruit-sell checks (min 5)
+    sellFruitDelay    = 10,      -- seconds between fruit-sell checks (min 5)
     autoClaimMailbox  = true,    -- auto-claim all your mailbox rewards
-    claimMailboxDelay = 60,      -- seconds between mailbox claims (min 10)
+    claimMailboxDelay = 10,      -- seconds between mailbox claims (min 10)
 
     ------------------------------------------------------------------ MISC
-    noclip      = true,    -- pass through everything + kill fling velocity (anti-fling)
+    antiFling   = true,    -- cancel fling/knockback velocity each frame (collision stays ON, unlike noclip)
     autoRejoin  = true,    -- rejoin a fresh server if Roblox disconnects/kicks you (Error 279, garden-load kick, etc.)
     skipLoading = true,    -- auto-skip the loading screen once it is fully loaded
     fpsBoost    = true,    -- strip the world for max FPS (everything returns on rejoin)
@@ -81,22 +83,21 @@ do
     end)
 end
 
--- Noclip + anti-fling. Runs before physics each frame: character passes through
--- everything (no collision → nothing can collision-fling us), and any velocity is
--- zeroed (kills knockback/fling from other players AND keeps us from falling through
--- the world). Movement here is CFrame-driven, so we don't need real collision/velocity.
+-- Anti-fling (no noclip). The old build flipped every character part to
+-- CanCollide=false each frame too -- that is what made the character float frozen
+-- and read as "not loaded", and GaG2's anti-cheat trips on the collision tampering.
+-- We drop noclip entirely and only cancel velocity, since movement is CFrame-driven.
 RunService.Stepped:Connect(function()
-    if not st.noclip then return end
+    if not st.antiFling then return end
     local char = LocalPlayer.Character
-    if not char then return end
-    for _, p in ipairs(char:GetDescendants()) do
-        if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
-    end
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if root then
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-    end
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    -- Cancel any velocity before physics runs: kills knockback/fling from other
+    -- players and physics glitches. Collision stays ON, so the character loads,
+    -- stands on the ground / FPS floor, and renders normally. Movement is
+    -- CFrame-driven, so zeroing velocity never blocks our own motion.
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
 end)
 
 local function hrp()
