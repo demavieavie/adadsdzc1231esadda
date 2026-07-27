@@ -22,11 +22,12 @@ local CONFIG = {
 
     ------------------------------------------------------------------ AUTO COLLECT
     autoSellFruit     = true,    -- auto-sell ALL your fruit (Steven's "Sell All")
-    sellFruitDelay    = 5,      -- seconds between fruit-sell checks (min 5)
+    sellFruitDelay    = 30,      -- seconds between fruit-sell checks (min 5)
     autoClaimMailbox  = true,    -- auto-claim all your mailbox rewards
-    claimMailboxDelay = 5,      -- seconds between mailbox claims (min 10)
+    claimMailboxDelay = 60,      -- seconds between mailbox claims (min 10)
 
     ------------------------------------------------------------------ MISC
+    autoRejoin  = true,    -- rejoin a fresh server if Roblox disconnects/kicks you (Error 279, garden-load kick, etc.)
     skipLoading = true,    -- auto-skip the loading screen once it is fully loaded
     fpsBoost    = true,    -- strip the world for max FPS (everything returns on rejoin)
 }
@@ -56,6 +57,27 @@ if not okPSC then PlayerStateClient = nil end
 
 local function notify(msg)
     print("[AutoTame] " .. msg)
+end
+
+-- Auto-rejoin: when Roblox throws a disconnect/kick error (Error 279, the "garden took
+-- too long to load" kick, lost connection, etc.) jump straight back into a fresh server.
+-- GuiService.ErrorMessageChanged fires the moment that error prompt appears; we retry the
+-- teleport a few times because the client may still have a heartbeat for a second or two.
+-- Best-effort — if the client tears down instantly, your executor's built-in Auto-Rejoin
+-- is the backstop (it lives outside the game's Lua and survives a hard kick).
+do
+    local rejoinPlaceId = game.PlaceId
+    local rejoinBusy = false
+    game:GetService("GuiService").ErrorMessageChanged:Connect(function()
+        if not st.autoRejoin or rejoinBusy then return end
+        rejoinBusy = true
+        notify("Disconnected — rejoining...")
+        for _ = 1, 6 do
+            pcall(function() TeleportService:Teleport(rejoinPlaceId, LocalPlayer) end)
+            task.wait(1.5)
+        end
+        rejoinBusy = false
+    end)
 end
 
 local function hrp()
