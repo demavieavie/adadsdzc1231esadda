@@ -824,25 +824,6 @@ TeleportService.TeleportInitFailed:Connect(function(player, result)
     end
 end)
 
-local function fetchHopServers()
-    local pid = game.PlaceId
-    local list = {}
-    local ok, body = pcall(function()
-        return game:HttpGet("https://games.roblox.com/v1/games/" .. pid .. "/servers/Public?sortOrder=Asc&limit=100")
-    end)
-    if ok then
-        local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
-        if ok2 and type(data) == "table" and type(data.data) == "table" then
-            for _, s in ipairs(data.data) do
-                if s.id ~= game.JobId and type(s.playing) == "number" and type(s.maxPlayers) == "number" and s.playing < s.maxPlayers then
-                    list[#list + 1] = s.id
-                end
-            end
-        end
-    end
-    return list
-end
-
 -- Roblox shows its own "Teleport Failed" dialog (CoreGui.RobloxGui.ErrorPrompt) on a
 -- failed teleport (e.g. Error 769). It's only UI and does NOT block the teleport API,
 -- but we hide it so it doesn't pile up on screen while we retry.
@@ -858,24 +839,25 @@ local function serverHop()
     local q = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
     if type(q) == "function" then pcall(q, "getgenv().WisHubGaG2TameResume = true") end
     local pid = game.PlaceId
-    local servers = fetchHopServers()
     local attempt = 0
-    -- retry until a teleport actually takes us out. On success the client leaves and
-    -- this loop never continues; only a real TeleportInitFailed loops back to retry.
+    -- Matchmaking teleport (NOT TeleportToPlaceInstance). Roblox routes us to a server
+    -- that is actually joinable AT CONNECT TIME, instead of a snapshot jobId from the
+    -- public list that can fill/close in the seconds before we arrive -- which is what
+    -- caused the "Connection Failed (Error Code 2)" spam on GaG2's fast-churning 8-slot
+    -- servers. On success the client leaves and this thread dies here; we only loop back
+    -- on a real TeleportInitFailed (rate-limit / transient), with a backoff.
+    -- NOTE: a post-init connect drop (Error Code 2) still can't be recovered from Lua
+    -- (the old server's VM is already dead) -- enable your executor's built-in
+    -- Auto-Rejoin to catch the rare one that slips through.
     while st.autoTame and st.autoHop do
         attempt = attempt + 1
         dismissTeleportError()   -- clear any leftover "Teleport Failed" popup
         teleportFailed = false
         teleportFailResult = nil
-        if #servers > 0 then
-            local jobId = table.remove(servers, math.random(1, #servers))  -- always a different server
-            pcall(function() TeleportService:TeleportToPlaceInstance(pid, jobId, LocalPlayer) end)
-        else
-            pcall(function() TeleportService:Teleport(pid, LocalPlayer) end)  -- matchmaking → fresh instance
-        end
+        pcall(function() TeleportService:Teleport(pid, LocalPlayer) end)
         -- On a real teleport the client leaves and this whole thread dies right here, so
-        -- we never continue. We only fall through on a failure (e.g. server full) OR when
-        -- the teleport is STUCK — nothing happened within 1 minute → rejoin.
+        -- we never continue. We only fall through on a failure OR when the teleport is
+        -- STUCK -- nothing happened within 1 minute -> retry.
         local t0 = os.clock()
         while not teleportFailed and os.clock() - t0 < 60 do
             if not (st.autoTame and st.autoHop) then return false end
@@ -884,13 +866,12 @@ local function serverHop()
         if teleportFailed then
             local flooded = teleportFailResult == Enum.TeleportResult.Flooded
             notify(flooded and ("Rate-limited, waiting (#%d)"):format(attempt)
-                or ("Server full/failed, retrying (#%d)"):format(attempt))
-            task.wait(flooded and 12 or 2)  -- fast retry; back off only when rate-limited
+                or ("Teleport failed, retrying (#%d)"):format(attempt))
+            task.wait(flooded and 12 or 3)  -- fast retry; back off only when rate-limited
         else
-            notify(("Teleport stuck 1m, rejoining (#%d)"):format(attempt))
+            notify(("Teleport stuck 1m, retrying (#%d)"):format(attempt))
             task.wait(1)
         end
-        if #servers == 0 then servers = fetchHopServers() end  -- refill the pool
     end
     return false
 end
