@@ -27,6 +27,7 @@ local CONFIG = {
     claimMailboxDelay = 5,      -- seconds between mailbox claims (min 10)
 
     ------------------------------------------------------------------ MISC
+    noclip      = true,    -- pass through everything + kill fling velocity (anti-fling)
     autoRejoin  = true,    -- rejoin a fresh server if Roblox disconnects/kicks you (Error 279, garden-load kick, etc.)
     skipLoading = true,    -- auto-skip the loading screen once it is fully loaded
     fpsBoost    = true,    -- strip the world for max FPS (everything returns on rejoin)
@@ -79,6 +80,24 @@ do
         rejoinBusy = false
     end)
 end
+
+-- Noclip + anti-fling. Runs before physics each frame: character passes through
+-- everything (no collision → nothing can collision-fling us), and any velocity is
+-- zeroed (kills knockback/fling from other players AND keeps us from falling through
+-- the world). Movement here is CFrame-driven, so we don't need real collision/velocity.
+RunService.Stepped:Connect(function()
+    if not st.noclip then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    for _, p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+    end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if root then
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end
+end)
 
 local function hrp()
     local c = LocalPlayer.Character
