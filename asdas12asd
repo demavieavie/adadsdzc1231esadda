@@ -1,4 +1,3 @@
-
 if _G.__WISHUB_GAG2_AUTOTAME then return end
 _G.__WISHUB_GAG2_AUTOTAME = true
 
@@ -8,6 +7,11 @@ local CONFIG = {
     autoTame        = true,    -- true = continuously tame matching wild pets
     autoHop         = true,   -- true = clear this server, then hop to a new one for more
     hopDelay        = 13,       -- seconds to wait before each server hop (5-30)
+    hopJitter       = 8,        -- + 0..N random extra seconds per hop so the fleet desyncs (0 = off)
+    useFinder       = true,     -- hop STRAIGHT to a server that already has a wanted pet (WisHUB pet finder)
+    finderPublicMix = 0.3,      -- fraction of hops that skip the finder and do a plain public random hop (0..1)
+    finderRarities  = {},       -- which rarities to chase via the finder. {} = all. e.g. {"Legendary","Mythic","Super"}
+    finderToken     = "6d35e00d087f9b53de54381a82a5e5c52e9c93088bf0bde9",  -- pet-finder read token (Bearer)
     tameRarities    = {},      -- only these rarities, e.g. {"Legendary","Mythic","Super"}.  {} = any
     tameNames       = {},      -- only these species, e.g. {"Raccoon","Dragonfly"}.          {} = any
     tameMoveSpeed   = 8,      -- how fast you walk to each pet (16 = normal ... 50 = max)
@@ -32,6 +36,7 @@ local CONFIG = {
     antiFling   = true,    -- cancel fling/knockback velocity each frame (collision stays ON, unlike noclip)
     autoRejoin  = true,    -- rejoin a fresh server if Roblox disconnects/kicks you (Error 279, garden-load kick, etc.)
     charLoadTimeout = 10,  -- avatar never appears (no char/analog stick)? rejoin after this many seconds (0 = off)
+    rejoinOnError   = 3,    -- after this many back-to-back tame-loop errors, instant-rejoin to unstick (0 = off)
     skipLoading = true,    -- auto-skip the loading screen once it is fully loaded
     fpsBoost    = true,    -- strip the world for max FPS (everything returns on rejoin)
 
@@ -52,6 +57,8 @@ local TeleportService = game:GetService("TeleportService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local Lighting = game:GetService("Lighting")
 local LocalPlayer = Players.LocalPlayer
+-- per-alt RNG seed so hop jitter + server pick diverge across a fleet launched together
+pcall(function() math.randomseed(os.clock() * 1e6 + (LocalPlayer.UserId % 1000000)) end)
 local Networking = require(RS.SharedModules.Networking)
 local Sheckles = LocalPlayer:WaitForChild("leaderstats", 30):WaitForChild("Sheckles", 30)
 
@@ -650,7 +657,7 @@ local function pickTarget()
         local rp = visual:FindFirstChild("RootPart")
         local ref = refFor(visual)
         local cd = cooldown[visual]
-        if rp and ref and (not cd or cd < now) and tonumber(ref:GetAttribute("OwnerUserId")) == 0 then
+        if rp and typeof(ref) == "Instance" and (not cd or cd < now) and tonumber(ref:GetAttribute("OwnerUserId")) == 0 then
             local rarity = tostring(ref:GetAttribute("Rarity"))
             local pname = tostring(ref:GetAttribute("PetName"))
             local price = tonumber(ref:GetAttribute("Price")) or 0
@@ -922,26 +929,166 @@ local function dismissTeleportError()
     end)
 end
 
+-- Fetch the public server list, keeping joinable ones WITH their population, sorted
+-- emptiest-first. serverHop then picks a random one from the emptiest slice: that
+-- SPREADS the fleet across different servers (so our own alts don't pile into one
+-- 8-slot server and fight over the same wild pets) while favouring low-pop servers
+-- (less churn -> fewer post-init "Error Code 2" connect drops).
+-- ---------- WisHUB Pet Finder (targeted hop) ----------
+-- Instead of hopping to a random server, ask the finder which servers currently HAVE
+-- our wanted pets and jump straight to one. Endpoint returns a flat array, one row per
+-- (pet, server): {pet_name, rarity, job_id, players, max_players, expires_at(unix), ...}.
+-- Each report lives ~90s, so we require >= FINDER_MIN_REMAINING seconds left.
+local PetRarityByName = {
+    Bunny = "Common", Frog = "Common",
+    Owl = "Uncommon",
+    Deer = "Rare",
+    Bee = "Legendary", Robin = "Legendary", Dragonfly = "Legendary", Wolf = "Legendary",
+    Fox = "Mythic", Turkey = "Mythic", Squirrel = "Mythic", Bear = "Mythic",
+    GoldenDragonfly = "Mythic", Monkey = "Mythic", Unicorn = "Mythic", Dog = "Mythic",
+    ShadowDragon = "Super", Swan = "Super", BlackDragon = "Super", IceSerpent = "Super", Raccoon = "Super",
+}
+local FINDER_BASE = "https://gag2petfinder.wishub.cloud/api/wq7x2k9p"
+local FINDER_MIN_REMAINING = 20
+local finderFailedJobs = {}   -- job_id -> os.clock() expiry; skip servers a teleport just failed on
+
+local function finderRequestFn()
+    return (WIS_Request and WIS_Request.request) or (syn and syn.request)
+        or (fluxus and fluxus.request) or (http and http.request) or http_request or request
+end
+
+local function finderPetNames()
+    local want = st.finderRarities
+    local restrict = type(want) == "table" and #want > 0
+    local names = {}
+    for name, rarity in pairs(PetRarityByName) do
+        if not restrict or table.find(want, rarity) then
+            names[#names + 1] = name
+        end
+    end
+    return names
+end
+
+local function finderFetch()
+    if not st.useFinder then return nil end
+    local req = finderRequestFn()
+    if type(req) ~= "function" then return nil end
+    local names = finderPetNames()
+    if #names == 0 then return nil end
+    local url = FINDER_BASE .. "?pet_name=" .. table.concat(names, ",")
+    local resp
+    local ok = pcall(function()
+        resp = req({
+            Url = url,
+            Method = "GET",
+            Headers = {
+                ["Authorization"] = "Bearer " .. tostring(st.finderToken or ""),
+                ["Cache-Control"] = "no-store",
+            },
+        })
+    end)
+    if not ok or not resp then return nil end
+    local body = resp.Body or resp.body
+    if type(body) ~= "string" then return nil end
+    local decoded
+    if not pcall(function() decoded = HttpService:JSONDecode(body) end) then return nil end
+    return type(decoded) == "table" and decoded or nil
+end
+
+-- Return a job_id that has a wanted pet (enough time left, not full, not the current
+-- server, not recently failed). Dedupe by job, then pick RANDOM among the emptiest good
+-- candidates so a co-launched fleet spreads across different pet-servers, not all one.
+local function finderPickJobId()
+    local pets = finderFetch()
+    if not pets then return nil end
+    local cur = tostring(game.JobId)
+    local now = os.time()
+    local clock = os.clock()
+    local best = {}
+    for _, p in ipairs(pets) do
+        local job = tostring(p.job_id or "")
+        local remain = (tonumber(p.expires_at) and (p.expires_at - now)) or tonumber(p.remaining) or 0
+        local players = tonumber(p.players) or 0
+        local maxp = tonumber(p.max_players) or 8
+        local failed = finderFailedJobs[job]
+        if job ~= "" and job ~= cur and remain >= FINDER_MIN_REMAINING and players < maxp
+            and not (failed and failed > clock) then
+            local prev = best[job]
+            if not prev or remain > prev.remain then best[job] = { players = players, remain = remain } end
+        end
+    end
+    -- Spread the fleet: random across MANY matching servers, not the 20 emptiest (that
+    -- pigeonholes >20 alts into the same handful). Prefer low-pop (<=3 players) WHEN the
+    -- pool of them is big enough; otherwise random over all valid servers.
+    local emptyish, all = {}, {}
+    for job, info in pairs(best) do
+        all[#all + 1] = job
+        if info.players <= 3 then emptyish[#emptyish + 1] = job end
+    end
+    local pool = (#emptyish >= 20) and emptyish or all
+    if #pool == 0 then return nil end
+    return pool[math.random(1, #pool)]
+end
+
+local function fetchHopServers()
+    local pid = game.PlaceId
+    local list = {}
+    local ok, body = pcall(function()
+        return game:HttpGet("https://games.roblox.com/v1/games/" .. pid .. "/servers/Public?sortOrder=Asc&limit=100")
+    end)
+    if ok then
+        local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
+        if ok2 and type(data) == "table" and type(data.data) == "table" then
+            for _, s in ipairs(data.data) do
+                if s.id ~= game.JobId and type(s.playing) == "number" and type(s.maxPlayers) == "number"
+                    and s.playing < s.maxPlayers then
+                    list[#list + 1] = { id = s.id, playing = s.playing }
+                end
+            end
+        end
+    end
+    table.sort(list, function(a, b) return a.playing < b.playing end)   -- emptiest first
+    return list
+end
+
 local function serverHop()
     local q = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
     if type(q) == "function" then pcall(q, "getgenv().WisHubGaG2TameResume = true") end
     local pid = game.PlaceId
     local attempt = 0
-    -- Matchmaking teleport (NOT TeleportToPlaceInstance). Roblox routes us to a server
-    -- that is actually joinable AT CONNECT TIME, instead of a snapshot jobId from the
-    -- public list that can fill/close in the seconds before we arrive -- which is what
-    -- caused the "Connection Failed (Error Code 2)" spam on GaG2's fast-churning 8-slot
-    -- servers. On success the client leaves and this thread dies here; we only loop back
-    -- on a real TeleportInitFailed (rate-limit / transient), with a backoff.
-    -- NOTE: a post-init connect drop (Error Code 2) still can't be recovered from Lua
-    -- (the old server's VM is already dead) -- enable your executor's built-in
-    -- Auto-Rejoin to catch the rare one that slips through.
+    -- Instance-hop to a specific low-pop server so the fleet SPREADS (matchmaking piled
+    -- our alts into the same servers -> most tamed 0). Refetch fresh each attempt (stale
+    -- jobIds are the main Error-Code-2 cause) and pick RANDOM from the emptiest servers
+    -- so two alts hopping at once rarely land together. Matchmaking is only the fallback
+    -- when the list fetch fails. On success the client leaves and this thread dies here;
+    -- we loop back only on a caught TeleportInitFailed.
+    -- NOTE: a post-init connect drop (Error Code 2) can't be recovered from Lua (the old
+    -- server's VM is already dead) -- keep your executor's built-in Auto-Rejoin on for it.
     while st.autoTame and st.autoHop do
         attempt = attempt + 1
         dismissTeleportError()   -- clear any leftover "Teleport Failed" popup
         teleportFailed = false
         teleportFailResult = nil
-        pcall(function() TeleportService:Teleport(pid, LocalPlayer) end)
+
+        -- 1) finder: jump straight to a server that HAS a wanted pet. 2) else random
+        -- instance-hop to an empty server. 3) else matchmaking. Remember which job we
+        -- tried so a failure can blacklist it briefly. finderPublicMix% of hops skip the
+        -- finder on purpose (diversify where the fleet lands + catch pets it didn't list).
+        local usePublic = math.random() < (tonumber(st.finderPublicMix) or 0)
+        local usedJob = (st.useFinder and not usePublic) and finderPickJobId() or nil
+        if usedJob then
+            pcall(function() TeleportService:TeleportToPlaceInstance(pid, usedJob, LocalPlayer) end)
+        else
+            local servers = fetchHopServers()
+            if #servers > 0 then
+                local subset = math.min(#servers, 25)           -- the 25 emptiest joinable servers
+                local choice = servers[math.random(1, subset)]  -- random within them -> fleet spreads out
+                usedJob = choice.id
+                pcall(function() TeleportService:TeleportToPlaceInstance(pid, choice.id, LocalPlayer) end)
+            else
+                pcall(function() TeleportService:Teleport(pid, LocalPlayer) end)  -- fallback: matchmaking
+            end
+        end
         -- On a real teleport the client leaves and this whole thread dies right here, so
         -- we never continue. We only fall through on a failure OR when the teleport is
         -- STUCK -- nothing happened within 1 minute -> retry.
@@ -952,11 +1099,12 @@ local function serverHop()
         end
         if teleportFailed then
             local flooded = teleportFailResult == Enum.TeleportResult.Flooded
+            if usedJob then finderFailedJobs[usedJob] = os.clock() + 45 end  -- don't re-pick a dud server
             notify(flooded and ("Rate-limited, waiting (#%d)"):format(attempt)
-                or ("Teleport failed, retrying (#%d)"):format(attempt))
+                or ("Server full/failed, retrying (#%d)"):format(attempt))
             reportError(flooded and "Teleport rate-limited (Flooded) while hopping"
                 or ("Teleport failed while hopping: " .. tostring(teleportFailResult)))
-            task.wait(flooded and 12 or 3)  -- fast retry; back off only when rate-limited
+            task.wait(flooded and 12 or 2)  -- fast retry; back off only when rate-limited
         else
             notify(("Teleport stuck 1m, retrying (#%d)"):format(attempt))
             task.wait(1)
@@ -965,7 +1113,21 @@ local function serverHop()
     return false
 end
 
+-- When the tame loop throws over and over the bot is wedged in a bad server/state and
+-- won't recover on its own (e.g. the GetAttribute-on-a-table crash). Bail out INSTANTLY
+-- via matchmaking -- the fastest reliable exit -- so it doesn't sit there erroring.
+local function instantRejoin(reason)
+    reportError("Stuck (" .. tostring(reason) .. ") -- instant rejoin")
+    local q = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+    if type(q) == "function" then pcall(q, "getgenv().WisHubGaG2TameResume = true") end
+    for _ = 1, 6 do
+        pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
+        task.wait(1.5)
+    end
+end
+
 task.spawn(function()
+    local errStreak = 0
     while true do
         task.wait(0.4)
         if st.autoTame then
@@ -997,7 +1159,9 @@ task.spawn(function()
                         end
                         for p in pairs(firedPrompts) do firedPrompts[p] = nil end  -- fresh slate
                         local hd = math.clamp(tonumber(st.hopDelay) or 5, 5, 30)
-                        notify(("Hopping in %ss"):format(tostring(math.floor(hd))))
+                        local jitter = math.max(0, tonumber(st.hopJitter) or 0)
+                        if jitter > 0 then hd = hd + math.random() * jitter end   -- desync the fleet
+                        notify(("Hopping in %.0fs"):format(hd))
                         local hstart = os.clock()
                         while os.clock() - hstart < hd and st.autoTame and st.autoHop do
                             task.wait(0.2)
@@ -1015,7 +1179,17 @@ task.spawn(function()
                     if target then doTameStep(target, ref) end
                 end
             end)
-            if not __ok then reportError(__err) end
+            if not __ok then
+                reportError(__err)
+                errStreak = errStreak + 1
+                local thr = math.max(0, math.floor(tonumber(st.rejoinOnError) or 0))
+                if thr > 0 and errStreak >= thr then
+                    errStreak = 0
+                    instantRejoin(__err)
+                end
+            else
+                errStreak = 0
+            end
         end
     end
 end)
