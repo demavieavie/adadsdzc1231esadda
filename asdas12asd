@@ -7,10 +7,10 @@ local CONFIG = {
     ------------------------------------------------------------------ AUTO TAME
     autoTame        = true,    -- true = continuously tame matching wild pets
     autoHop         = true,   -- true = clear this server, then hop to a new one for more
-    hopDelay        = 8,       -- seconds to wait before each server hop (5-30)
+    hopDelay        = 13,       -- seconds to wait before each server hop (5-30)
     tameRarities    = {},      -- only these rarities, e.g. {"Legendary","Mythic","Super"}.  {} = any
     tameNames       = {},      -- only these species, e.g. {"Raccoon","Dragonfly"}.          {} = any
-    tameMoveSpeed   = 30,      -- how fast you walk to each pet (16 = normal ... 50 = max)
+    tameMoveSpeed   = 8,      -- how fast you walk to each pet (16 = normal ... 50 = max)
     tameReturnAfter = true,    -- (no effect while protectWildTame is false)
     maxPetPrice     = 0,       -- skip pets costing more than this (0 = no limit). Number, e.g. 15e6
     protectWildTame = false,   -- hold the shovel + knock back nearby players while taming
@@ -34,6 +34,10 @@ local CONFIG = {
     charLoadTimeout = 10,  -- avatar never appears (no char/analog stick)? rejoin after this many seconds (0 = off)
     skipLoading = true,    -- auto-skip the loading screen once it is fully loaded
     fpsBoost    = true,    -- strip the world for max FPS (everything returns on rejoin)
+
+    ------------------------------------------------------------------ DISCORD WEBHOOK
+    webhook     = true,    -- send a Discord report each server (before every hop) + on errors
+    webhookUrl  = "https://discord.com/api/webhooks/1525087279155122267/lB4JdLjO0lDuJPYBem1cNXvBfU3dAiiETpXjfY74ypu8tkrtpij9xB-cN4sy1turW6cA",
 }
 
 
@@ -346,6 +350,77 @@ local tameResultAt = {}
 -- by its own id, so 3 tames read back as 3 separate success results — never 1 reused.
 local pendingTameKey = nil
 local pendingTameAt = 0
+
+-- ---------- Discord webhook reporting ----------
+-- Counts confirmed tames in the CURRENT server. A hop teleports (fresh Lua VM) so
+-- these reset to 0 on the next server automatically; we report them just before the hop.
+local sessionTamed = 0
+local sessionPets = {}      -- "Name (Rarity)" list, filled as each tame confirms
+local petMeta = {}          -- petKey -> {name,rarity}, captured at fire time
+
+local httpRequest = (syn and syn.request) or (fluxus and fluxus.request)
+    or (http and http.request) or http_request or request
+
+local function sendWebhook(payload)
+    if not st.webhook then return end
+    local url = tostring(st.webhookUrl or "")
+    if url == "" or type(httpRequest) ~= "function" then return end
+    local body
+    if not pcall(function() body = HttpService:JSONEncode(payload) end) then return end
+    -- executor request is synchronous, so before a hop the POST lands before we teleport
+    pcall(function()
+        httpRequest({
+            Url = url,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = body,
+        })
+    end)
+end
+
+local function playerTag()
+    return LocalPlayer.Name .. " (" .. tostring(LocalPlayer.UserId) .. ")"
+end
+
+local function reportDone()
+    if not st.webhook then return end
+    local pets = (#sessionPets > 0) and table.concat(sessionPets, ", ") or "none"
+    sendWebhook({
+        embeds = { {
+            title = "GaG2 Auto Tame - Server done",
+            color = 3066993,
+            fields = {
+                { name = "Player", value = playerTag(), inline = true },
+                { name = "Tamed this server", value = tostring(sessionTamed), inline = true },
+                { name = "Pets", value = string.sub(pets, 1, 1000) },
+                { name = "Next", value = "Hopping to a new server" },
+            },
+            footer = { text = "WisHUB GaG2 | JobId " .. tostring(game.JobId) },
+        } },
+    })
+end
+
+local lastErrAt, lastErrMsg = 0, nil
+local function reportError(msg)
+    if not st.webhook then return end
+    msg = tostring(msg or "unknown error")
+    local now = os.clock()
+    if msg == lastErrMsg and now - lastErrAt < 30 then return end   -- dedupe spam
+    lastErrAt, lastErrMsg = now, msg
+    sendWebhook({
+        embeds = { {
+            title = "GaG2 Auto Tame - Error",
+            color = 15158332,
+            description = string.sub(msg, 1, 1800),
+            fields = {
+                { name = "Player", value = playerTag(), inline = true },
+                { name = "Tamed before error", value = tostring(sessionTamed), inline = true },
+            },
+            footer = { text = "WisHUB GaG2 | JobId " .. tostring(game.JobId) },
+        } },
+    })
+end
+
 Networking.Pets.WildPetTameResult.OnClientEvent:Connect(function(petPart, who)
     if who == LocalPlayer.UserId then
         lastTameSuccessAt = os.clock()
@@ -353,6 +428,12 @@ Networking.Pets.WildPetTameResult.OnClientEvent:Connect(function(petPart, who)
             local k = petKey(petPart.Name)
             tameResultAt[k] = os.clock()          -- per-pet result, keyed by that pet
             if pendingTameKey == k then pendingTameKey = nil end
+            sessionTamed = sessionTamed + 1       -- count for the per-server webhook report
+            local meta = petMeta[k]
+            local label = (meta and meta.name) and tostring(meta.name) or "Pet"
+            if meta and meta.rarity then label = label .. " (" .. tostring(meta.rarity) .. ")" end
+            sessionPets[#sessionPets + 1] = label
+            petMeta[k] = nil
         end
     end
 end)
@@ -366,6 +447,12 @@ end
 local function markTameFired(ref)
     pendingTameKey = petKey(ref.Name)
     pendingTameAt = os.clock()
+    if ref then                                   -- remember name/rarity for the webhook label
+        petMeta[petKey(ref.Name)] = {
+            name = ref:GetAttribute("PetName"),
+            rarity = ref:GetAttribute("Rarity"),
+        }
+    end
 end
 
 local function clearTamePending(ref)
@@ -867,6 +954,8 @@ local function serverHop()
             local flooded = teleportFailResult == Enum.TeleportResult.Flooded
             notify(flooded and ("Rate-limited, waiting (#%d)"):format(attempt)
                 or ("Teleport failed, retrying (#%d)"):format(attempt))
+            reportError(flooded and "Teleport rate-limited (Flooded) while hopping"
+                or ("Teleport failed while hopping: " .. tostring(teleportFailResult)))
             task.wait(flooded and 12 or 3)  -- fast retry; back off only when rate-limited
         else
             notify(("Teleport stuck 1m, retrying (#%d)"):format(attempt))
@@ -880,7 +969,7 @@ task.spawn(function()
     while true do
         task.wait(0.4)
         if st.autoTame then
-            pcall(function()
+            local __ok, __err = pcall(function()
                 if st.autoHop then
                     local readyDeadline = os.clock() + 15
                     while (not hrp() or not mapFolder("WildPetSpawns")) and os.clock() < readyDeadline do
@@ -914,6 +1003,9 @@ task.spawn(function()
                             task.wait(0.2)
                         end
                         if st.autoTame and st.autoHop then
+                            reportDone()               -- report this server's tally before leaving
+                            sessionTamed = 0
+                            table.clear(sessionPets)
                             serverHop()
                             task.wait(5)
                         end
@@ -923,6 +1015,7 @@ task.spawn(function()
                     if target then doTameStep(target, ref) end
                 end
             end)
+            if not __ok then reportError(__err) end
         end
     end
 end)
