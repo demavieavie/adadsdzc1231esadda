@@ -31,6 +31,7 @@ local CONFIG = {
     ------------------------------------------------------------------ MISC
     antiFling   = true,    -- cancel fling/knockback velocity each frame (collision stays ON, unlike noclip)
     autoRejoin  = true,    -- rejoin a fresh server if Roblox disconnects/kicks you (Error 279, garden-load kick, etc.)
+    charLoadTimeout = 10,  -- avatar never appears (no char/analog stick)? rejoin after this many seconds (0 = off)
     skipLoading = true,    -- auto-skip the loading screen once it is fully loaded
     fpsBoost    = true,    -- strip the world for max FPS (everything returns on rejoin)
 }
@@ -105,49 +106,183 @@ local function hrp()
     return c and c:FindFirstChild("HumanoidRootPart")
 end
 
+-- Character-load watchdog. Sometimes GaG2 finishes loading (the UI + hotbar are up)
+-- but never actually spawns your avatar -- no character, no analog stick, just the
+-- garden -- and nothing recovers on its own. If we're in the gameplay phase (loading
+-- done, no cutscene, no loading menu) yet have no HumanoidRootPart for
+-- charLoadTimeout seconds straight, rejoin a fresh server. When loading itself is
+-- hung (never reached the gameplay phase) we wait longer before force-rejoining so a
+-- slow-but-legit load isn't cut short.
+do
+    local function inGameplayPhase()
+        if LocalPlayer:GetAttribute("LoadingScreenDone") ~= true then return false end
+        if LocalPlayer:GetAttribute("OfflineCutscenePlaying") == true then return false end
+        if LocalPlayer:GetAttribute("CutsceneInputBlocked") == true then return false end
+        if workspace:FindFirstChild("LoadingScreenMenu") then return false end
+        return true
+    end
+
+    task.spawn(function()
+        local missingSince = nil
+        local busy = false
+        while true do
+            task.wait(0.5)
+            local timeout = tonumber(st.charLoadTimeout) or 0
+            if timeout <= 0 or busy or hrp() then
+                missingSince = nil
+            else
+                missingSince = missingSince or os.clock()
+                local waited = os.clock() - missingSince
+                local limit = inGameplayPhase() and timeout or math.max(timeout, 45)
+                if waited >= limit then
+                    busy = true
+                    notify(("No character for %ds -- rejoining..."):format(math.floor(waited)))
+                    for _ = 1, 6 do
+                        pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
+                        task.wait(1.5)
+                    end
+                    busy = false
+                    missingSince = nil
+                end
+            end
+        end
+    end)
+end
+
 local function mapFolder(name)
     local m = workspace:FindFirstChild("Map")
     return m and m:FindFirstChild(name)
 end
 
+-- Skip the join loading screen, fastest-first. Runs at load (autoexec) while the
+-- loading screen's own thread is still alive, so its internals are reachable -- which
+-- a post-load injector can't touch. Layers:
+--   1. fastTeardown via getgc -- call the controller's own instant-teardown local ->
+--      straight to the Humanoid camera, no cinematic fly-in.
+--   2. fire the controller's InputBegan skip listener (sets its `skipRequested`) --
+--      its normal teardown; the listener ignores the input object so :Fire works.
+--   3. VirtualInputManager key/click -- the original simulated-input path.
+--   4. force CameraType=Custom + Humanoid subject as a final guarantee.
+-- Any layer that isn't available/identifiable safely falls through to the next.
 local function skipLoadingScreen()
-    local menu = workspace:FindFirstChild("LoadingScreenMenu")
+    local menu = workspace:FindFirstChild("LoadingScreenMenu") or workspace:WaitForChild("LoadingScreenMenu", 20)
     if not menu then return end
 
-    local gui     = menu:WaitForChild("LoadingGui", 15)
-    local variant = gui and gui:WaitForChild("Variant1Frame", 15)
-    local inner   = variant and variant:WaitForChild("InnerFrame", 15)
-    local counter = inner and inner:WaitForChild("CounterTxt", 15)
-    -- if we can't read the counter we CANNOT confirm state — never act blindly
-    if not counter then return end
-    local skip = inner:FindFirstChild("SkipTxt")
+    local gui     = menu:FindFirstChild("LoadingGui") or menu:WaitForChild("LoadingGui", 15)
+    local inner   = gui and (gui:FindFirstChild("Variant1Frame") or gui:WaitForChild("Variant1Frame", 15))
+    inner = inner and (inner:FindFirstChild("InnerFrame") or inner:WaitForChild("InnerFrame", 15))
+    local counter = inner and inner:FindFirstChild("CounterTxt")
+    local skip    = inner and inner:FindFirstChild("SkipTxt")
 
-    -- Skippable when the game says so: either CounterTxt hits 100% ("Fully Loaded!"),
-    -- OR the "Click to skip!" prompt has faded in. SkipTxt starts fully transparent and
-    -- only becomes visible (TextTransparency < 1) once input is actually accepted, so
-    -- that's the reliable early-skip signal — not the always-present default text.
+    local function loadingGone()
+        return (not workspace:FindFirstChild("LoadingScreenMenu"))
+            or LocalPlayer:GetAttribute("LoadingScreenDone") == true
+    end
+
+    -- Skippable when the game says so: CounterTxt hits "Fully Loaded!", OR the
+    -- "Click to skip!" prompt faded in (SkipTxt only becomes visible once input is
+    -- actually accepted). Only relevant to layers 2/3 (layer 1 doesn't need it).
     local function skippableNow()
-        if string.find(counter.Text, "Fully Loaded", 1, true) then return true end
+        if counter and string.find(counter.Text, "Fully Loaded", 1, true) then return true end
         if skip and string.find(skip.Text, "Click to skip", 1, true) and skip.TextTransparency < 1 then
             return true
         end
         return false
     end
 
-    local waited = 0
-    while counter.Parent and not skippableNow() and waited < 400 do
-        task.wait(0.3)
-        waited = waited + 1
+    -- (4) guarantee: make sure the character camera is back on afterward.
+    local function ensureHumanoidCamera()
+        pcall(function()
+            local cam = workspace.CurrentCamera
+            if cam.CameraType ~= Enum.CameraType.Custom then
+                cam.CameraType = Enum.CameraType.Custom
+            end
+            local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if hum then cam.CameraSubject = hum end
+        end)
     end
-    if not skippableNow() then return end   -- never became skippable → don't act
 
-    -- The loading screen is dismissed by UserInputService.InputBegan — it reacts to
-    -- ANY input and IGNORES mouse position. A key event is the most reliable trigger.
-    -- Fire it (plus a center click) until the menu actually closes.
-    local tries = 0
-    while tries < 20
-        and workspace:FindFirstChild("LoadingScreenMenu")
-        and LocalPlayer:GetAttribute("LoadingScreenDone") ~= true do
+    -- (1) fastTeardown: find LoadingScreenController's local `fastTeardown` in the GC.
+    -- Strong signature so we never call the wrong function: source is the loading
+    -- controller, a mid-size upvalue list, EXACTLY one function upvalue (showGuis),
+    -- and it holds both the LocalPlayer and the loading-screen instance. The big
+    -- startLoading IIFE captures many functions, so it's excluded (calling it would
+    -- clone a second loading screen). If nothing matches, we fall through.
+    local function findFastTeardown()
+        if type(getgc) ~= "function" or type(debug) ~= "table" or type(debug.getupvalues) ~= "function" then
+            return nil
+        end
+        for _, fn in ipairs(getgc(true)) do
+            if type(fn) == "function" then
+                local oks, src = pcall(debug.info, fn, "s")
+                if oks and type(src) == "string" and string.find(src, "LoadingScreen") then
+                    local oku, ups = pcall(debug.getupvalues, fn)
+                    if oku and type(ups) == "table" then
+                        local total, nFuncs, hasPlayer, hasMenu = 0, 0, false, false
+                        for _, v in pairs(ups) do
+                            total = total + 1
+                            local tv = typeof(v)
+                            if tv == "function" then nFuncs = nFuncs + 1 end
+                            if tv == "Instance" then
+                                if v == LocalPlayer then hasPlayer = true end
+                                if v.Name == "LoadingScreenMenu" or v.Name == "LoadingGui" then hasMenu = true end
+                            end
+                        end
+                        if total >= 12 and total <= 26 and nFuncs == 1 and hasPlayer and hasMenu then
+                            return fn
+                        end
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function tryFastTeardown()
+        local fn = findFastTeardown()
+        if not fn then return false end
+        pcall(fn)
+        for _ = 1, 12 do
+            if loadingGone() then return true end
+            task.wait(0.05)
+        end
+        return loadingGone()
+    end
+
+    -- (2) fire ONLY the loading screen's own InputBegan listener. Prefer an exact
+    -- source match (LoadingScreenController). Other controllers (Plots/Mutation/etc.)
+    -- also connect InputBegan with 2 upvalues, so the fallback is deliberately strict:
+    -- exactly 2 upvalues that are BOTH boolean -- the `if u101 then u99=true` skip
+    -- handler's signature -- and it's used only when no source match is found.
+    local function tryFireSkip()
+        if type(getconnections) ~= "function" then return false end
+        local matched, fallback = {}, {}
+        for _, c in ipairs(getconnections(UserInputService.InputBegan)) do
+            local f = c.Function
+            if f and type(c.Fire) == "function" then
+                local oks, src = pcall(debug.info, f, "s")
+                if oks and type(src) == "string" and string.find(src, "LoadingScreen") then
+                    matched[#matched + 1] = c
+                elseif type(debug) == "table" and type(debug.getupvalues) == "function" then
+                    local oku, ups = pcall(debug.getupvalues, f)
+                    if oku and type(ups) == "table" then
+                        local total, allBool = 0, true
+                        for _, v in pairs(ups) do
+                            total = total + 1
+                            if type(v) ~= "boolean" then allBool = false end
+                        end
+                        if total == 2 and allBool then fallback[#fallback + 1] = c end
+                    end
+                end
+            end
+        end
+        local list = (#matched > 0) and matched or fallback
+        for _, c in ipairs(list) do pcall(function() c:Fire() end) end
+        return #list > 0
+    end
+
+    -- (3) simulated input -- the original reliable fallback.
+    local function vimSkip()
         pcall(function()
             VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
             task.wait(0.03)
@@ -159,9 +294,43 @@ local function skipLoadingScreen()
             task.wait(0.03)
             VirtualInputManager:SendMouseButtonEvent(vp.X / 2, vp.Y / 2, 0, false, game, 0)
         end)
-        tries = tries + 1
-        task.wait(0.3)
     end
+
+    -- records which layer actually dismissed the screen (read _G.__WISHUB_SKIP after a
+    -- rejoin to verify -- e.g. "1:fastTeardown" means the instant path fired).
+    local function mark(via) _G.__WISHUB_SKIP = via end
+
+    -- Wait for a safe drop-in point (game loaded + character present) so the teardown's
+    -- PivotTo(SpawnPoint) lands us correctly; this still skips the ~5s cosmetic fake-load.
+    local w = 0
+    while not loadingGone()
+        and (not game:IsLoaded()
+            or not (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")))
+        and w < 60 do
+        task.wait(0.2); w = w + 0.2
+    end
+    if loadingGone() then mark("0:already-gone"); ensureHumanoidCamera(); return end
+
+    -- (1) instant path
+    if tryFastTeardown() then mark("1:fastTeardown"); ensureHumanoidCamera(); return end
+
+    -- (2)/(3): wait until the game marks it skippable, then fire the listener, else VIM
+    local waited = 0
+    while not loadingGone() and not skippableNow() and waited < 120 do
+        task.wait(0.2); waited = waited + 0.2
+    end
+    if loadingGone() then mark("0:gone-before-fire"); ensureHumanoidCamera(); return end
+
+    local firedListener = false
+    local tries = 0
+    while not loadingGone() and tries < 40 do
+        if tryFireSkip() then firedListener = true else vimSkip() end
+        tries = tries + 1
+        task.wait(0.2)
+    end
+
+    mark(firedListener and "2:fireListener" or "3:vim")
+    ensureHumanoidCamera()
 end
 
 if st.skipLoading then task.spawn(skipLoadingScreen) end
