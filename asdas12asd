@@ -226,7 +226,7 @@ local function skipLoadingScreen()
         for _, fn in ipairs(getgc(true)) do
             if type(fn) == "function" then
                 local oks, src = pcall(debug.info, fn, "s")
-                if oks and type(src) == "string" and string.find(src, "LoadingScreen") then
+                if oks and type(src) == "string" and string.find(src, "Loading") then
                     local oku, ups = pcall(debug.getupvalues, fn)
                     if oku and type(ups) == "table" then
                         local total, nFuncs, hasPlayer, hasMenu = 0, 0, false, false
@@ -322,25 +322,28 @@ local function skipLoadingScreen()
     end
     if loadingGone() then mark("0:already-gone"); ensureHumanoidCamera(); return end
 
-    -- (1) instant path
-    if tryFastTeardown() then mark("1:fastTeardown"); ensureHumanoidCamera(); return end
-
-    -- (2)/(3): wait until the game marks it skippable, then fire the listener, else VIM
-    local waited = 0
-    while not loadingGone() and not skippableNow() and waited < 120 do
-        task.wait(0.2); waited = waited + 0.2
-    end
-    if loadingGone() then mark("0:gone-before-fire"); ensureHumanoidCamera(); return end
-
-    local firedListener = false
+    -- Dismiss loop. fastTeardown (the controller's own instant teardown, grabbed from
+    -- getgc) is the ONLY method that actually dismisses on the NO MERCY DELTA cloud
+    -- emulator -- VirtualInputManager, firesignal and setupvalue on the InputBegan handler
+    -- all no-op there (verified live). So retry fastTeardown EVERY tick; fireListener/VIM
+    -- are only extra attempts for other executors. Runs the moment the game is loaded
+    -- (fastTeardown doesn't need the "skippable" state).
+    local lastMethod = nil
     local tries = 0
-    while not loadingGone() and tries < 40 do
-        if tryFireSkip() then firedListener = true else vimSkip() end
+    while not loadingGone() and tries < 80 do
+        if tryFastTeardown() then
+            lastMethod = "1:fastTeardown"
+        elseif skippableNow() and tryFireSkip() then
+            lastMethod = "2:fireListener"
+        else
+            vimSkip()
+            lastMethod = "3:vim"
+        end
         tries = tries + 1
         task.wait(0.2)
     end
 
-    mark(firedListener and "2:fireListener" or "3:vim")
+    mark(lastMethod or "none")
     ensureHumanoidCamera()
 end
 
@@ -1017,17 +1020,25 @@ local function finderPickJobId()
             if not prev or remain > prev.remain then best[job] = { players = players, remain = remain } end
         end
     end
-    -- Spread the fleet: random across MANY matching servers, not the 20 emptiest (that
-    -- pigeonholes >20 alts into the same handful). Prefer low-pop (<=3 players) WHEN the
-    -- pool of them is big enough; otherwise random over all valid servers.
-    local emptyish, all = {}, {}
+    -- Spread the fleet: WEIGHTED-random over ALL joinable servers (weight = free slots,
+    -- so emptier is likelier but the whole pool stays in play). Restricting to the
+    -- emptiest few made the pool smaller than the fleet -> guaranteed overlap; using all
+    -- of them maximises the number of distinct landing spots. (Still not zero-collision at
+    -- fleet scale -- only a backend claim/lease can guarantee that.)
+    local list, total = {}, 0
     for job, info in pairs(best) do
-        all[#all + 1] = job
-        if info.players <= 3 then emptyish[#emptyish + 1] = job end
+        local w = math.max(1, 8 - (info.players or 0))
+        list[#list + 1] = { job = job, w = w }
+        total = total + w
     end
-    local pool = (#emptyish >= 20) and emptyish or all
-    if #pool == 0 then return nil end
-    return pool[math.random(1, #pool)]
+    if #list == 0 then return nil end
+    local r = math.random() * total
+    local acc = 0
+    for _, c in ipairs(list) do
+        acc = acc + c.w
+        if r <= acc then return c.job end
+    end
+    return list[#list].job
 end
 
 local function fetchHopServers()
@@ -1081,8 +1092,7 @@ local function serverHop()
         else
             local servers = fetchHopServers()
             if #servers > 0 then
-                local subset = math.min(#servers, 25)           -- the 25 emptiest joinable servers
-                local choice = servers[math.random(1, subset)]  -- random within them -> fleet spreads out
+                local choice = servers[math.random(1, #servers)]  -- random over ALL fetched -> widest spread
                 usedJob = choice.id
                 pcall(function() TeleportService:TeleportToPlaceInstance(pid, choice.id, LocalPlayer) end)
             else
@@ -1099,12 +1109,20 @@ local function serverHop()
         end
         if teleportFailed then
             local flooded = teleportFailResult == Enum.TeleportResult.Flooded
-            if usedJob then finderFailedJobs[usedJob] = os.clock() + 45 end  -- don't re-pick a dud server
+            if usedJob then
+                -- Unauthorized = a private/VIP server (the finder reports pets from those
+                -- too, but we can't join them and they never become joinable) -> blacklist
+                -- for the whole session. GameEnded/full = transient -> short 45s.
+                local unauth = teleportFailResult == Enum.TeleportResult.Unauthorized
+                finderFailedJobs[usedJob] = os.clock() + (unauth and 36000 or 45)
+            end  -- don't re-pick a dud server
             notify(flooded and ("Rate-limited, waiting (#%d)"):format(attempt)
                 or ("Server full/failed, retrying (#%d)"):format(attempt))
-            reportError(flooded and "Teleport rate-limited (Flooded) while hopping"
-                or ("Teleport failed while hopping: " .. tostring(teleportFailResult)))
-            task.wait(flooded and 12 or 2)  -- fast retry; back off only when rate-limited
+            -- Teleport failures (GameEnded / Unauthorized / server full) are routine churn
+            -- -- do NOT report them to the webhook, that's just spam. Only real tame-loop
+            -- crashes report. Retry INSTANTLY (grab another server next tick); only Flooded
+            -- (rate-limit) needs a real backoff or retrying instantly keeps flooding.
+            if flooded then task.wait(12) else task.wait() end
         else
             notify(("Teleport stuck 1m, retrying (#%d)"):format(attempt))
             task.wait(1)
