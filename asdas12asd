@@ -5,12 +5,12 @@ local CONFIG = {
     ------------------------------------------------------------------ AUTO TAME
     autoTame        = true,    -- true = continuously tame matching wild pets
     autoHop         = true,   -- true = clear this server, then hop to a new one for more
-    hopDelay        = 5,       -- seconds to wait before each server hop (5-30)
+    hopDelay        = 13,       -- seconds to wait before each server hop (5-30)
     tameRarities    = {},      -- only these rarities, e.g. {"Legendary","Mythic","Super"}.  {} = any
     tameNames       = {},      -- only these species, e.g. {"Raccoon","Dragonfly"}.          {} = any
     tameMoveSpeed   = 16,      -- how fast you walk to each pet (16 = normal ... 50 = max)
     tameReturnAfter = true,    -- (no effect while protectWildTame is false)
-    maxPetPrice     = 20000000,       -- skip pets costing more than this (0 = no limit). Number, e.g. 15e6
+    maxPetPrice     = 0,       -- skip pets costing more than this (0 = no limit). Number, e.g. 15e6
     protectWildTame = false,   -- hold the shovel + knock back nearby players while taming
 
     ------------------------------------------------------------------ AUTO SELL PET
@@ -22,9 +22,9 @@ local CONFIG = {
 
     ------------------------------------------------------------------ AUTO COLLECT
     autoSellFruit     = true,    -- auto-sell ALL your fruit (Steven's "Sell All")
-    sellFruitDelay    = 5,      -- seconds between fruit-sell checks (min 5)
+    sellFruitDelay    = 30,      -- seconds between fruit-sell checks (min 5)
     autoClaimMailbox  = true,    -- auto-claim all your mailbox rewards
-    claimMailboxDelay = 5,      -- seconds between mailbox claims (min 10)
+    claimMailboxDelay = 60,      -- seconds between mailbox claims (min 10)
 
     ------------------------------------------------------------------ MISC
     noclip      = true,    -- pass through everything + kill fling velocity (anti-fling)
