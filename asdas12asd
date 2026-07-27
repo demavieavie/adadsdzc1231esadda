@@ -10,7 +10,7 @@ local CONFIG = {
     tameNames       = {},      -- only these species, e.g. {"Raccoon","Dragonfly"}.          {} = any
     tameMoveSpeed   = 16,      -- how fast you walk to each pet (16 = normal ... 50 = max)
     tameReturnAfter = true,    -- (no effect while protectWildTame is false)
-    maxPetPrice     = 50000000,       -- skip pets costing more than this (0 = no limit). Number, e.g. 15e6
+    maxPetPrice     = 20000000,       -- skip pets costing more than this (0 = no limit). Number, e.g. 15e6
     protectWildTame = false,   -- hold the shovel + knock back nearby players while taming
 
     ------------------------------------------------------------------ AUTO SELL PET
