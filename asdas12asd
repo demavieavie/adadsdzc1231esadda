@@ -1,4 +1,3 @@
-
 if _G.__WISHUB_GAG2_AUTOTAME then return end
 _G.__WISHUB_GAG2_AUTOTAME = true
 
@@ -20,6 +19,12 @@ local CONFIG = {
     selectedSellPetRarity   = { "Common", "Uncommon", "Rare", "Epic", "Legendary" },  -- sell these; Mythic + Super are kept
     sellPetBlacklistVariant = { "Big", "Huge", "Rainbow", "Mega" },  -- NEVER sell these variants
     sellPetDelay            = 0.5,     -- seconds between each sale (min 0.2)
+
+    ------------------------------------------------------------------ AUTO COLLECT
+    autoSellFruit     = true,    -- auto-sell ALL your fruit (Steven's "Sell All")
+    sellFruitDelay    = 5,      -- seconds between fruit-sell checks (min 5)
+    autoClaimMailbox  = true,    -- auto-claim all your mailbox rewards
+    claimMailboxDelay = 5,      -- seconds between mailbox claims (min 10)
 
     ------------------------------------------------------------------ MISC
     skipLoading = true,    -- auto-skip the loading screen once it is fully loaded
@@ -1007,9 +1012,36 @@ local function startFpsBoost()
     end)
 end
 
+-- ── Auto Sell Fruit — fire Steven's "Sell All" whenever you have fruit ───────
+task.spawn(function()
+    while true do
+        task.wait(math.max(5, tonumber(st.sellFruitDelay) or 30))
+        if st.autoSellFruit then
+            pcall(function()
+                local preview = Networking.NPCS.PreviewSellAll:Fire()
+                if type(preview) == "table" and (tonumber(preview.FruitCount) or 0) > 0 then
+                    Networking.NPCS.SellAll:Fire()   -- sells at base value, no double-or-nothing
+                    notify(("Sold fruit x%s"):format(tostring(preview.FruitCount)))
+                end
+            end)
+        end
+    end
+end)
+
+-- ── Auto Claim Mailbox — claim every unclaimed reward ────────────────────────
+task.spawn(function()
+    while true do
+        task.wait(math.max(10, tonumber(st.claimMailboxDelay) or 60))
+        if st.autoClaimMailbox then
+            pcall(function() Networking.Mailbox.ClaimAll:Fire() end)
+        end
+    end
+end)
+
 -- ── kick everything off from the CONFIG above ───────────────────────────────
 startSellLoop()                          -- no-op unless CONFIG.autoSellPet is true
 if st.fpsBoost then startFpsBoost() end
 
-notify(("Loaded (no-UI) — autoTame=%s autoHop=%s autoSell=%s fpsBoost=%s"):format(
-    tostring(st.autoTame), tostring(st.autoHop), tostring(st.autoSellPet), tostring(st.fpsBoost)))
+notify(("Loaded (no-UI) — tame=%s hop=%s sellPet=%s sellFruit=%s mailbox=%s fps=%s"):format(
+    tostring(st.autoTame), tostring(st.autoHop), tostring(st.autoSellPet),
+    tostring(st.autoSellFruit), tostring(st.autoClaimMailbox), tostring(st.fpsBoost)))
