@@ -6,17 +6,18 @@ local CONFIG = {
     ------------------------------------------------------------------ AUTO TAME
     autoTame        = true,    -- true = continuously tame matching wild pets
     autoHop         = true,   -- true = clear this server, then hop to a new one for more
-    hopDelay        = 8,       -- seconds to wait before each server hop (5-30)
+    hopDelay        = 13,       -- seconds to wait AFTER a successful tame before hopping (5-30, catches respawns)
     hopJitter       = 8,        -- + 0..N random extra seconds per hop so the fleet desyncs (0 = off)
+    emptyHopGrace   = 4,        -- seconds to wait for a pet on join; no pet within this = hop INSTANTLY (no delay)
     useFinder       = true,     -- hop STRAIGHT to a server that already has a wanted pet (WisHUB pet finder)
     finderPublicMix = 0.3,      -- fraction of hops that skip the finder and do a plain public random hop (0..1)
     finderRarities  = {},       -- which rarities to chase via the finder. {} = all. e.g. {"Legendary","Mythic","Super"}
     finderToken     = "6d35e00d087f9b53de54381a82a5e5c52e9c93088bf0bde9",  -- pet-finder read token (Bearer)
     tameRarities    = {},      -- only these rarities, e.g. {"Legendary","Mythic","Super"}.  {} = any
     tameNames       = {},      -- only these species, e.g. {"Raccoon","Dragonfly"}.          {} = any
-    tameMoveSpeed   = 30,      -- how fast you walk to each pet (16 = normal ... 50 = max)
+    tameMoveSpeed   = 8,      -- how fast you walk to each pet (16 = normal ... 50 = max)
     tameReturnAfter = true,    -- (no effect while protectWildTame is false)
-    maxPetPrice     = 12000000,       -- skip pets costing more than this (0 = no limit). Number, e.g. 15e6
+    maxPetPrice     = 0,       -- skip pets costing more than this (0 = no limit). Number, e.g. 15e6
     protectWildTame = false,   -- hold the shovel + knock back nearby players while taming
 
     ------------------------------------------------------------------ AUTO SELL PET
@@ -1044,19 +1045,22 @@ end
 local function fetchHopServers()
     local pid = game.PlaceId
     local list = {}
-    local ok, body = pcall(function()
-        return game:HttpGet("https://games.roblox.com/v1/games/" .. pid .. "/servers/Public?sortOrder=Asc&limit=100")
-    end)
-    if ok then
+    local cursor = ""
+    for _ = 1, 3 do   -- up to 3 pages (~300 servers) -> much wider pool, fewer fleet collisions
+        local url = "https://games.roblox.com/v1/games/" .. pid .. "/servers/Public?sortOrder=Asc&limit=100"
+        if cursor ~= "" then url = url .. "&cursor=" .. cursor end
+        local ok, body = pcall(function() return game:HttpGet(url) end)
+        if not ok then break end
         local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
-        if ok2 and type(data) == "table" and type(data.data) == "table" then
-            for _, s in ipairs(data.data) do
-                if s.id ~= game.JobId and type(s.playing) == "number" and type(s.maxPlayers) == "number"
-                    and s.playing < s.maxPlayers then
-                    list[#list + 1] = { id = s.id, playing = s.playing }
-                end
+        if not (ok2 and type(data) == "table" and type(data.data) == "table") then break end
+        for _, s in ipairs(data.data) do
+            if s.id ~= game.JobId and type(s.playing) == "number" and type(s.maxPlayers) == "number"
+                and s.playing < s.maxPlayers then
+                list[#list + 1] = { id = s.id, playing = s.playing }
             end
         end
+        cursor = tostring(data.nextPageCursor or "")
+        if cursor == "" then break end   -- no more pages
     end
     table.sort(list, function(a, b) return a.playing < b.playing end)   -- emptiest first
     return list
@@ -1151,11 +1155,23 @@ task.spawn(function()
         if st.autoTame then
             local __ok, __err = pcall(function()
                 if st.autoHop then
-                    local readyDeadline = os.clock() + 15
-                    while (not hrp() or not mapFolder("WildPetSpawns")) and os.clock() < readyDeadline do
+                    -- Wait until we are REALLY in gameplay before deciding "no pet": loading
+                    -- screen done + game loaded + character up + the wild-pet folder present.
+                    -- The character exists (anchored) DURING the loading screen, so hrp()
+                    -- alone was passing mid-load -> we called 0 pets on a not-yet-loaded
+                    -- server and hopped. LoadingScreenDone is the real "in-game" signal.
+                    local readyDeadline = os.clock() + 30
+                    while os.clock() < readyDeadline
+                        and (LocalPlayer:GetAttribute("LoadingScreenDone") ~= true
+                            or not game:IsLoaded()
+                            or not hrp()
+                            or not mapFolder("WildPetSpawns")) do
                         task.wait(0.3)
                     end
-                    local windowEnd = os.clock() + 8
+                    -- Find + tame window. If NO wanted pet shows up within a short grace,
+                    -- we hop IMMEDIATELY (empty server = don't linger). Once a pet appears,
+                    -- keep taming while more keep showing up.
+                    local windowEnd = os.clock() + math.max(1, tonumber(st.emptyHopGrace) or 4)
                     while st.autoTame and st.autoHop do
                         local target, ref = pickTarget()
                         if target then
@@ -1167,27 +1183,35 @@ task.spawn(function()
                         end
                     end
                     if st.autoTame and st.autoHop then
-                        -- hold until every proximity we fired on is actually gone from
-                        -- the workspace. Fired on 3 pets? All 3 prompts must disappear
-                        -- before we hop — even if the spawns already look empty.
+                        -- hold until every proximity we fired on is actually gone (a real
+                        -- tame removes the pet+prompt). No-op fast when we tamed nothing.
                         local held = os.clock()
                         while firedPromptsRemaining() > 0 and st.autoTame and st.autoHop
                             and os.clock() - held < 15 do
                             task.wait(0.2)
                         end
                         for p in pairs(firedPrompts) do firedPrompts[p] = nil end  -- fresh slate
-                        local hd = math.clamp(tonumber(st.hopDelay) or 5, 5, 30)
-                        local jitter = math.max(0, tonumber(st.hopJitter) or 0)
-                        if jitter > 0 then hd = hd + math.random() * jitter end   -- desync the fleet
-                        notify(("Hopping in %.0fs"):format(hd))
-                        local hstart = os.clock()
-                        while os.clock() - hstart < hd and st.autoTame and st.autoHop do
-                            task.wait(0.2)
+
+                        -- Hop delay ONLY after we actually tamed something (wait a bit for
+                        -- respawns / more pets, and report it). Tamed nothing = empty server
+                        -- -> hop INSTANTLY: no delay, no "0" webhook. Efficiency.
+                        if sessionTamed > 0 then
+                            reportDone()
+                            local hd = math.clamp(tonumber(st.hopDelay) or 5, 5, 30)
+                            local jitter = math.max(0, tonumber(st.hopJitter) or 0)
+                            if jitter > 0 then hd = hd + math.random() * jitter end   -- desync the fleet
+                            notify(("Tamed %d, hopping in %.0fs"):format(sessionTamed, hd))
+                            local hstart = os.clock()
+                            while os.clock() - hstart < hd and st.autoTame and st.autoHop do
+                                task.wait(0.2)
+                            end
+                        else
+                            notify("No pet here -- hopping now")
                         end
+
+                        sessionTamed = 0
+                        table.clear(sessionPets)
                         if st.autoTame and st.autoHop then
-                            reportDone()               -- report this server's tally before leaving
-                            sessionTamed = 0
-                            table.clear(sessionPets)
                             serverHop()
                             task.wait(5)
                         end
