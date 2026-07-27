@@ -7,7 +7,7 @@ local CONFIG = {
     ------------------------------------------------------------------ AUTO TAME
     autoTame        = true,    -- true = continuously tame matching wild pets
     autoHop         = true,   -- true = clear this server, then hop to a new one for more
-    hopDelay        = 13,       -- seconds to wait before each server hop (5-30)
+    hopDelay        = 8,       -- seconds to wait before each server hop (5-30)
     tameRarities    = {},      -- only these rarities, e.g. {"Legendary","Mythic","Super"}.  {} = any
     tameNames       = {},      -- only these species, e.g. {"Raccoon","Dragonfly"}.          {} = any
     tameMoveSpeed   = 28,      -- how fast you walk to each pet (16 = normal ... 50 = max)
