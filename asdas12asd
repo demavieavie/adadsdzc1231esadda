@@ -10,7 +10,7 @@ local CONFIG = {
     hopDelay        = 8,       -- seconds to wait before each server hop (5-30)
     tameRarities    = {},      -- only these rarities, e.g. {"Legendary","Mythic","Super"}.  {} = any
     tameNames       = {},      -- only these species, e.g. {"Raccoon","Dragonfly"}.          {} = any
-    tameMoveSpeed   = 28,      -- how fast you walk to each pet (16 = normal ... 50 = max)
+    tameMoveSpeed   = 30,      -- how fast you walk to each pet (16 = normal ... 50 = max)
     tameReturnAfter = true,    -- (no effect while protectWildTame is false)
     maxPetPrice     = 0,       -- skip pets costing more than this (0 = no limit). Number, e.g. 15e6
     protectWildTame = false,   -- hold the shovel + knock back nearby players while taming
